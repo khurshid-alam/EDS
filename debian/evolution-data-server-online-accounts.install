@@ -1,0 +1,6 @@
+usr/lib/evolution-data-server/credential-modules/module-credentials-goa.so
+usr/lib/evolution-data-server/credential-modules/module-credentials-uoa.so
+usr/lib/evolution-data-server/registry-modules/module-gnome-online-accounts.so
+usr/lib/evolution-data-server/registry-modules/module-ubuntu-online-accounts.so
+usr/share/accounts
+usr/share/applications/evolution-data-server-uoa.desktop

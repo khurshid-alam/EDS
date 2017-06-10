@@ -1,0 +1,12 @@
+usr/lib/evolution
+usr/lib/evolution-data-server/*-backends/*.so
+usr/lib/evolution-data-server/camel-providers/*.urls
+usr/lib/evolution-data-server/camel-providers/*.so
+usr/lib/evolution-data-server/registry-modules/module-yahoo-backend.so
+usr/lib/evolution-data-server/registry-modules/module-google-backend.so
+usr/lib/evolution-data-server/registry-modules/module-cache-reaper.so
+usr/lib/evolution-data-server/registry-modules/module-owncloud-backend.so
+usr/lib/evolution-data-server/registry-modules/module-outlook-backend.so
+usr/lib/evolution-data-server/registry-modules/module-secret-monitor.so
+usr/lib/evolution-data-server/registry-modules/module-trust-prompt.so
+usr/lib/systemd/user/*.service

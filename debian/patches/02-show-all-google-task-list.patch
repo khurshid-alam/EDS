@@ -1,0 +1,817 @@
+--- /dev/null
++++ b/modules/google-backend/e-gdata-oauth2-authorizer.c
+@@ -0,0 +1,362 @@
++/*
++ * e-gdata-oauth2-authorizer.c
++ *
++ * This library is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation.
++ *
++ * This library is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library. If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#include "e-gdata-oauth2-authorizer.h"
++
++#define E_GDATA_OAUTH2_AUTHORIZER_GET_PRIVATE(obj) \
++	(G_TYPE_INSTANCE_GET_PRIVATE \
++	((obj), E_TYPE_GDATA_OAUTH2_AUTHORIZER, EGDataOAuth2AuthorizerPrivate))
++
++struct _EGDataOAuth2AuthorizerPrivate {
++	GWeakRef source;
++
++	/* These members are protected by the global mutex. */
++	gchar *access_token;
++	GHashTable *authorization_domains;
++	ENamedParameters *credentials;
++};
++
++enum {
++	PROP_0,
++	PROP_SOURCE
++};
++
++/* GDataAuthorizer methods must be thread-safe. */
++static GMutex mutex;
++
++/* Forward Declarations */
++static void	e_gdata_oauth2_authorizer_interface_init
++					(GDataAuthorizerInterface *iface);
++
++G_DEFINE_TYPE_WITH_CODE (
++	EGDataOAuth2Authorizer,
++	e_gdata_oauth2_authorizer,
++	G_TYPE_OBJECT,
++	G_IMPLEMENT_INTERFACE (
++		GDATA_TYPE_AUTHORIZER,
++		e_gdata_oauth2_authorizer_interface_init))
++
++static gboolean
++gdata_oauth2_authorizer_is_authorized (GDataAuthorizer *authorizer,
++                                       GDataAuthorizationDomain *domain)
++{
++	EGDataOAuth2AuthorizerPrivate *priv;
++
++	/* This MUST be called with the mutex already locked. */
++
++	if (domain == NULL)
++		return TRUE;
++
++	priv = E_GDATA_OAUTH2_AUTHORIZER_GET_PRIVATE (authorizer);
++
++	return g_hash_table_contains (priv->authorization_domains, domain);
++}
++
++static void
++gdata_oauth2_authorizer_set_source (EGDataOAuth2Authorizer *authorizer,
++                                    ESource *source)
++{
++	g_return_if_fail (E_IS_SOURCE (source));
++
++	g_weak_ref_set (&authorizer->priv->source, source);
++}
++
++static void
++gdata_oauth2_authorizer_set_property (GObject *object,
++                                      guint property_id,
++                                      const GValue *value,
++                                      GParamSpec *pspec)
++{
++	switch (property_id) {
++		case PROP_SOURCE:
++			gdata_oauth2_authorizer_set_source (
++				E_GDATA_OAUTH2_AUTHORIZER (object),
++				g_value_get_object (value));
++			return;
++	}
++
++	G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++}
++
++static void
++gdata_oauth2_authorizer_get_property (GObject *object,
++                                      guint property_id,
++                                      GValue *value,
++                                      GParamSpec *pspec)
++{
++	switch (property_id) {
++		case PROP_SOURCE:
++			g_value_take_object (
++				value,
++				e_gdata_oauth2_authorizer_ref_source (
++				E_GDATA_OAUTH2_AUTHORIZER (object)));
++			return;
++	}
++
++	G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++}
++
++static void
++gdata_oauth2_authorizer_dispose (GObject *object)
++{
++	EGDataOAuth2AuthorizerPrivate *priv;
++
++	priv = E_GDATA_OAUTH2_AUTHORIZER_GET_PRIVATE (object);
++
++	g_weak_ref_set (&priv->source, NULL);
++
++	g_hash_table_remove_all (priv->authorization_domains);
++
++	/* Chain up to parent's dispose() method. */
++	G_OBJECT_CLASS (e_gdata_oauth2_authorizer_parent_class)->
++		dispose (object);
++}
++
++static void
++gdata_oauth2_authorizer_finalize (GObject *object)
++{
++	EGDataOAuth2AuthorizerPrivate *priv;
++
++	priv = E_GDATA_OAUTH2_AUTHORIZER_GET_PRIVATE (object);
++
++	g_free (priv->access_token);
++
++	g_hash_table_destroy (priv->authorization_domains);
++	g_weak_ref_clear (&priv->source);
++
++	e_named_parameters_free (priv->credentials);
++
++	/* Chain up to parent's finalize() method. */
++	G_OBJECT_CLASS (e_gdata_oauth2_authorizer_parent_class)->
++		finalize (object);
++}
++
++static void
++gdata_oauth2_authorizer_constructed (GObject *object)
++{
++	EGDataOAuth2AuthorizerPrivate *priv;
++	GType service_type;
++	GList *domains;
++
++	/* Chain up to parent's constructed() method. */
++	G_OBJECT_CLASS (e_gdata_oauth2_authorizer_parent_class)->constructed (object);
++
++	priv = E_GDATA_OAUTH2_AUTHORIZER_GET_PRIVATE (object);
++
++	/* XXX We would need to generalize this to make the class
++	 *     reusable for other service types, probably by adding
++	 *     a "service-type" constructor property. */
++	service_type = GDATA_TYPE_TASKS_SERVICE;
++	domains = gdata_service_get_authorization_domains (service_type);
++
++	while (domains != NULL) {
++		g_hash_table_add (
++			priv->authorization_domains,
++			g_object_ref (domains->data));
++		domains = g_list_delete_link (domains, domains);
++	}
++}
++
++static void
++gdata_oauth2_authorizer_process_request (GDataAuthorizer *authorizer,
++                                         GDataAuthorizationDomain *domain,
++                                         SoupMessage *message)
++{
++	EGDataOAuth2AuthorizerPrivate *priv;
++	gchar *authorization;
++
++	priv = E_GDATA_OAUTH2_AUTHORIZER_GET_PRIVATE (authorizer);
++
++	g_mutex_lock (&mutex);
++
++	if (!gdata_oauth2_authorizer_is_authorized (authorizer, domain))
++		goto exit;
++
++	/* We can't add an Authorization header without an access token.
++	 * Let the request fail.  GData should refresh us if it gets back
++	 * a "401 Authorization required" response from Google, and then
++	 * automatically retry the request. */
++	if (priv->access_token == NULL)
++		goto exit;
++
++	authorization = g_strdup_printf ("OAuth %s", priv->access_token);
++
++	/* Use replace here, not append, to make sure
++	 * there's only one "Authorization" header. */
++	soup_message_headers_replace (
++		message->request_headers,
++		"Authorization", authorization);
++
++	g_free (authorization);
++
++exit:
++	g_mutex_unlock (&mutex);
++}
++
++static gboolean
++gdata_oauth2_authorizer_is_authorized_for_domain (GDataAuthorizer *authorizer,
++                                                  GDataAuthorizationDomain *domain)
++{
++	gboolean authorized;
++
++	g_mutex_lock (&mutex);
++
++	authorized = gdata_oauth2_authorizer_is_authorized (authorizer, domain);
++
++	g_mutex_unlock (&mutex);
++
++	return authorized;
++}
++
++static gboolean
++gdata_oauth2_authorizer_refresh_authorization (GDataAuthorizer *authorizer,
++                                               GCancellable *cancellable,
++                                               GError **error)
++{
++	EGDataOAuth2Authorizer *oauth2_authorizer;
++	ESource *source;
++	gchar **ptr_access_token;
++	gboolean success = FALSE;
++
++	oauth2_authorizer = E_GDATA_OAUTH2_AUTHORIZER (authorizer);
++	source = e_gdata_oauth2_authorizer_ref_source (oauth2_authorizer);
++	g_return_val_if_fail (source != NULL, FALSE);
++
++	ptr_access_token = &oauth2_authorizer->priv->access_token;
++
++	g_mutex_lock (&mutex);
++
++	g_free (*ptr_access_token);
++	*ptr_access_token = NULL;
++
++	success = e_util_get_source_oauth2_access_token_sync (source, oauth2_authorizer->priv->credentials,
++		ptr_access_token, NULL, cancellable, error);
++	printf ("%s: succ:%d\n", __FUNCTION__, success);
++
++	g_mutex_unlock (&mutex);
++
++	g_object_unref (source);
++
++	return success;
++}
++
++static void
++e_gdata_oauth2_authorizer_class_init (EGDataOAuth2AuthorizerClass *class)
++{
++	GObjectClass *object_class;
++
++	g_type_class_add_private (
++		class, sizeof (EGDataOAuth2AuthorizerPrivate));
++
++	object_class = G_OBJECT_CLASS (class);
++	object_class->set_property = gdata_oauth2_authorizer_set_property;
++	object_class->get_property = gdata_oauth2_authorizer_get_property;
++	object_class->dispose = gdata_oauth2_authorizer_dispose;
++	object_class->finalize = gdata_oauth2_authorizer_finalize;
++	object_class->constructed = gdata_oauth2_authorizer_constructed;
++
++	g_object_class_install_property (
++		object_class,
++		PROP_SOURCE,
++		g_param_spec_object (
++			"source",
++			"Source",
++			"The data source to authenticate",
++			E_TYPE_SOURCE,
++			G_PARAM_READWRITE |
++			G_PARAM_CONSTRUCT_ONLY |
++			G_PARAM_STATIC_STRINGS));
++}
++
++static void
++e_gdata_oauth2_authorizer_interface_init (GDataAuthorizerInterface *iface)
++{
++	iface->process_request =
++		gdata_oauth2_authorizer_process_request;
++	iface->is_authorized_for_domain =
++		gdata_oauth2_authorizer_is_authorized_for_domain;
++	iface->refresh_authorization =
++		gdata_oauth2_authorizer_refresh_authorization;
++}
++
++static void
++e_gdata_oauth2_authorizer_init (EGDataOAuth2Authorizer *authorizer)
++{
++	GHashTable *authorization_domains;
++
++	authorization_domains = g_hash_table_new_full (
++		(GHashFunc) g_direct_hash,
++		(GEqualFunc) g_direct_equal,
++		(GDestroyNotify) g_object_unref,
++		(GDestroyNotify) NULL);
++
++	authorizer->priv = E_GDATA_OAUTH2_AUTHORIZER_GET_PRIVATE (authorizer);
++	authorizer->priv->authorization_domains = authorization_domains;
++	g_weak_ref_init (&authorizer->priv->source, NULL);
++}
++
++EGDataOAuth2Authorizer *
++e_gdata_oauth2_authorizer_new (ESource *source)
++{
++	g_return_val_if_fail (E_IS_SOURCE (source), NULL);
++
++	return g_object_new (
++		E_TYPE_GDATA_OAUTH2_AUTHORIZER,
++		"source", source, NULL);
++}
++
++ESource *
++e_gdata_oauth2_authorizer_ref_source (EGDataOAuth2Authorizer *authorizer)
++{
++	g_return_val_if_fail (E_IS_GDATA_OAUTH2_AUTHORIZER (authorizer), NULL);
++
++	return g_weak_ref_get (&authorizer->priv->source);
++}
++
++void
++e_gdata_oauth2_authorizer_set_credentials (EGDataOAuth2Authorizer *authorizer,
++					   const ENamedParameters *credentials)
++{
++	g_return_if_fail (E_IS_GDATA_OAUTH2_AUTHORIZER (authorizer));
++
++	g_mutex_lock (&mutex);
++
++	e_named_parameters_free (authorizer->priv->credentials);
++	if (credentials)
++		authorizer->priv->credentials = e_named_parameters_new_clone (credentials);
++	else
++		authorizer->priv->credentials = NULL;
++
++	g_mutex_unlock (&mutex);
++}
++
++ENamedParameters *
++e_gdata_oauth2_authorizer_clone_credentials (EGDataOAuth2Authorizer *authorizer)
++{
++	ENamedParameters *credentials = NULL;
++
++	g_return_val_if_fail (E_IS_GDATA_OAUTH2_AUTHORIZER (authorizer), NULL);
++
++	g_mutex_lock (&mutex);
++
++	if (authorizer->priv->credentials)
++		credentials = e_named_parameters_new_clone (authorizer->priv->credentials);
++
++	g_mutex_unlock (&mutex);
++
++	return credentials;
++}
+--- /dev/null
++++ b/modules/google-backend/e-gdata-oauth2-authorizer.h
+@@ -0,0 +1,74 @@
++/*
++ * e-gdata-oauth2-authorizer.h
++ *
++ * This library is free software: you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation.
++ *
++ * This library is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
++ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this library. If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#ifndef E_GDATA_OAUTH2_AUTHORIZER_H
++#define E_GDATA_OAUTH2_AUTHORIZER_H
++
++#include <gdata/gdata.h>
++#include <libedataserver/libedataserver.h>
++
++/* Standard GObject macros */
++#define E_TYPE_GDATA_OAUTH2_AUTHORIZER \
++	(e_gdata_oauth2_authorizer_get_type ())
++#define E_GDATA_OAUTH2_AUTHORIZER(obj) \
++	(G_TYPE_CHECK_INSTANCE_CAST \
++	((obj), E_TYPE_GDATA_OAUTH2_AUTHORIZER, EGDataOAuth2Authorizer))
++#define E_GDATA_OAUTH2_AUTHORIZER_CLASS(cls) \
++	(G_TYPE_CHECK_CLASS_CAST \
++	((cls), E_TYPE_GDATA_OAUTH2_AUTHORIZER, EGDataOAuth2AuthorizerClass))
++#define E_IS_GDATA_OAUTH2_AUTHORIZER(obj) \
++	(G_TYPE_CHECK_INSTANCE_TYPE \
++	((obj), E_TYPE_GDATA_OAUTH2_AUTHORIZER))
++#define E_IS_GDATA_OAUTH2_AUTHORIZER_CLASS(cls) \
++	(G_TYPE_CHECK_CLASS_TYPE \
++	((cls), E_TYPE_GDATA_OAUTH2_AUTHORIZER))
++#define E_GDATA_OAUTH2_AUTHORIZER_GET_CLASS(obj) \
++	(G_TYPE_INSTANCE_GET_CLASS \
++	((obj), E_TYPE_GDATA_OAUTH2_AUTHORIZER, EGDataOAuth2AuthorizerClass))
++
++G_BEGIN_DECLS
++
++typedef struct _EGDataOAuth2Authorizer EGDataOAuth2Authorizer;
++typedef struct _EGDataOAuth2AuthorizerClass EGDataOAuth2AuthorizerClass;
++typedef struct _EGDataOAuth2AuthorizerPrivate EGDataOAuth2AuthorizerPrivate;
++
++struct _EGDataOAuth2Authorizer {
++	GObject parent;
++	EGDataOAuth2AuthorizerPrivate *priv;
++};
++
++struct _EGDataOAuth2AuthorizerClass {
++	GObjectClass parent_class;
++};
++
++GType		e_gdata_oauth2_authorizer_get_type
++					(void) G_GNUC_CONST;
++EGDataOAuth2Authorizer *
++		e_gdata_oauth2_authorizer_new
++					(ESource *source);
++ESource *	e_gdata_oauth2_authorizer_ref_source
++					(EGDataOAuth2Authorizer *authorizer);
++void		e_gdata_oauth2_authorizer_set_credentials
++					(EGDataOAuth2Authorizer *authorizer,
++					 const ENamedParameters *credentials);
++ENamedParameters *
++		e_gdata_oauth2_authorizer_clone_credentials
++					(EGDataOAuth2Authorizer *authorizer);
++
++G_END_DECLS
++
++#endif /* E_GDATA_OAUTH2_AUTHORIZER_H */
+--- a/modules/google-backend/module-google-backend.c
++++ b/modules/google-backend/module-google-backend.c
+@@ -30,6 +30,10 @@
+ #define GDATA_CHECK_VERSION(major,minor,micro) 0
+ #endif
+ 
++#if GDATA_CHECK_VERSION(0,15,1)
++#include "e-gdata-oauth2-authorizer.h"
++#endif
++
+ /* Standard GObject macros */
+ #define E_TYPE_GOOGLE_BACKEND \
+ 	(e_google_backend_get_type ())
+@@ -59,7 +63,6 @@
+ 
+ /* Tasks Configuration Details */
+ #define GOOGLE_TASKS_BACKEND_NAME	"gtasks"
+-#define GOOGLE_TASKS_RESOURCE_ID	"Tasks List"
+ 
+ typedef struct _EGoogleBackend EGoogleBackend;
+ typedef struct _EGoogleBackendClass EGoogleBackendClass;
+@@ -313,11 +316,11 @@
+ 
+ static void
+ google_add_found_source (ECollectionBackend *collection,
+-			   EWebDAVDiscoverSupports source_type,
+-			   SoupURI *uri,
+-			   const gchar *display_name,
+-			   const gchar *color,
+-			   GHashTable *known_sources)
++			 EWebDAVDiscoverSupports source_type,
++			 SoupURI *uri,
++			 const gchar *display_name,
++			 const gchar *color,
++			 GHashTable *known_sources)
+ {
+ 	ESourceRegistryServer *server;
+ 	ESourceBackend *backend;
+@@ -443,6 +446,87 @@
+ 	g_object_unref (server);
+ }
+ 
++#if GDATA_CHECK_VERSION(0,15,1)
++static void
++google_add_task_list (ECollectionBackend *collection,
++		      const gchar *resource_id,
++		      const gchar *display_name,
++		      GHashTable *known_sources)
++{
++	ESourceRegistryServer *server;
++	ESource *source;
++	ESource *collection_source;
++	ESourceExtension *extension;
++	ESourceCollection *collection_extension;
++	ESourceResource *resource;
++	const gchar *source_uid;
++	gchar *identity;
++	gboolean is_new;
++
++	collection_source = e_backend_get_source (E_BACKEND (collection));
++
++	server = e_collection_backend_ref_server (collection);
++	if (!server)
++		return;
++
++	identity = g_strconcat (GOOGLE_TASKS_BACKEND_NAME, "::", resource_id, NULL);
++	source_uid = g_hash_table_lookup (known_sources, identity);
++	is_new = !source_uid;
++	if (is_new) {
++		source = e_collection_backend_new_child (collection, identity);
++		g_warn_if_fail (source != NULL);
++	} else {
++		source = e_source_registry_server_ref_source (server, source_uid);
++		g_warn_if_fail (source != NULL);
++
++		g_hash_table_remove (known_sources, identity);
++	}
++
++	resource = e_source_get_extension (source, E_SOURCE_EXTENSION_RESOURCE);
++	e_source_resource_set_identity (resource, identity);
++
++	e_source_set_display_name (source, display_name);
++	e_source_set_enabled (source, TRUE);
++
++	collection_extension = e_source_get_extension (
++		collection_source, E_SOURCE_EXTENSION_COLLECTION);
++
++	/* Configure the calendar source. */
++
++	extension = e_source_get_extension (source, E_SOURCE_EXTENSION_TASK_LIST);
++
++	e_source_backend_set_backend_name (E_SOURCE_BACKEND (extension), GOOGLE_TASKS_BACKEND_NAME);
++
++	extension = e_source_get_extension (source, E_SOURCE_EXTENSION_AUTHENTICATION);
++
++	e_source_authentication_set_host (E_SOURCE_AUTHENTICATION (extension), "www.google.com");
++	if (google_backend_can_use_google_auth (collection_source))
++		e_source_authentication_set_method (E_SOURCE_AUTHENTICATION (extension), "Google");
++	else
++		e_source_authentication_set_method (E_SOURCE_AUTHENTICATION (extension), "OAuth2");
++
++	e_binding_bind_property (
++		collection_extension, "identity",
++		extension, "user",
++		G_BINDING_SYNC_CREATE);
++
++	extension = e_source_get_extension (source, E_SOURCE_EXTENSION_ALARMS);
++	e_source_alarms_set_include_me (E_SOURCE_ALARMS (extension), FALSE);
++
++	if (is_new) {
++		ESourceRegistryServer *server;
++
++		server = e_collection_backend_ref_server (collection);
++		e_source_registry_server_add_source (server, source);
++		g_object_unref (server);
++	}
++
++	g_object_unref (source);
++	g_object_unref (server);
++	g_free (identity);
++}
++#endif /* GDATA_CHECK_VERSION(0,15,1) */
++
+ static ESourceAuthenticationResult
+ google_backend_authenticate_sync (EBackend *backend,
+ 				  const ENamedParameters *credentials,
+@@ -490,6 +574,9 @@
+ 	g_list_foreach (sources, google_add_uid_to_hashtable, known_sources);
+ 	g_list_free_full (sources, g_object_unref);
+ 
++	/* When the WebDAV extension is created, the auth method can be reset, thus ensure
++	   it's there before setting correct authentication method on the master source. */
++	(void) e_source_get_extension (source, E_SOURCE_EXTENSION_WEBDAV_BACKEND);
+ 	google_backend_calendar_update_auth_method (source, NULL);
+ 
+ 	if (goa_extension) {
+@@ -503,6 +590,8 @@
+ 			method = e_source_authentication_dup_method (auth_extension);
+ 			if (g_strcmp0 (method, "Google") == 0)
+ 				calendar_url = "https://apidata.googleusercontent.com/caldav/v2/";
++
++			g_free (method);
+ 		}
+ 	}
+ 
+@@ -541,18 +630,8 @@
+ 		any_success = TRUE;
+ 	}
+ 
+-	if (any_success) {
+-		ESourceRegistryServer *server;
+-
+-		server = e_collection_backend_ref_server (collection);
+-
+-		if (server) {
+-			g_hash_table_foreach (known_sources, google_remove_unknown_sources_cb, server);
+-			g_object_unref (server);
+-		}
+-
++	if (any_success)
+ 		g_clear_error (&local_error);
+-	}
+ 
+ 	if (local_error == NULL) {
+ 		result = E_SOURCE_AUTHENTICATION_ACCEPTED;
+@@ -569,78 +648,73 @@
+ 		g_propagate_error (error, local_error);
+ 	}
+ 
+-	g_hash_table_destroy (known_sources);
+-	e_named_parameters_free (credentials_copy);
+-
+-	return result;
+-}
+-
+ #if GDATA_CHECK_VERSION(0,15,1)
+-static void
+-google_backend_add_tasks (ECollectionBackend *backend)
+-{
+-	ESource *source;
+-	ESource *collection_source;
+-	ESourceRegistryServer *server;
+-	ESourceExtension *extension;
+-	ESourceCollection *collection_extension;
+-	const gchar *backend_name;
+-	const gchar *extension_name;
+-	const gchar *resource_id;
+-
+-	/* FIXME As a future enhancement, we should query Google
+-	 *       for a list of user calendars and add them to the
+-	 *       collection with matching display names and colors. */
+-
+-	collection_source = e_backend_get_source (E_BACKEND (backend));
+-
+-	/* Tasks require OAuth2 */
+-	if (!e_source_has_extension (collection_source, E_SOURCE_EXTENSION_GOA) &&
+-	    !e_source_credentials_google_is_supported ())
+-		return;
+-
+-	resource_id = GOOGLE_TASKS_RESOURCE_ID;
+-	source = e_collection_backend_new_child (backend, resource_id);
+-	e_source_set_display_name (source, _("Tasks"));
+-
+-	collection_extension = e_source_get_extension (
+-		collection_source, E_SOURCE_EXTENSION_COLLECTION);
+-
+-	/* Configure the calendar source. */
+-
+-	backend_name = GOOGLE_TASKS_BACKEND_NAME;
++	if (result == E_SOURCE_AUTHENTICATION_ACCEPTED &&
++	    e_source_collection_get_calendar_enabled (collection_extension) &&
++	    (goa_extension || e_source_credentials_google_is_supported ())) {
++		EGDataOAuth2Authorizer *authorizer;
++		GDataTasksService *tasks_service;
++
++		authorizer = e_gdata_oauth2_authorizer_new (e_backend_get_source (backend));
++		e_gdata_oauth2_authorizer_set_credentials (authorizer, credentials);
++
++		tasks_service = gdata_tasks_service_new (GDATA_AUTHORIZER (authorizer));
++
++		e_binding_bind_property (
++			backend, "proxy-resolver",
++			tasks_service, "proxy-resolver",
++			G_BINDING_SYNC_CREATE);
++
++		if (gdata_authorizer_refresh_authorization (GDATA_AUTHORIZER (authorizer), cancellable, &local_error)) {
++			GDataQuery *query;
++			GDataFeed *feed;
++
++			query = gdata_query_new (NULL);
++			feed = gdata_tasks_service_query_all_tasklists (tasks_service, query, cancellable, NULL, NULL, &local_error);
++			if (feed) {
++				GList *link;
++
++				for (link = gdata_feed_get_entries (feed); link; link = g_list_next (link)) {
++					GDataEntry *entry = link->data;
++
++					if (entry) {
++						google_add_task_list (collection,
++							gdata_entry_get_id (entry),
++							gdata_entry_get_title (entry),
++							known_sources);
++					}
++				}
++			}
+ 
+-	extension_name = E_SOURCE_EXTENSION_TASK_LIST;
+-	extension = e_source_get_extension (source, extension_name);
++			g_clear_object (&feed);
++			g_object_unref (query);
++		}
+ 
+-	e_source_backend_set_backend_name (
+-		E_SOURCE_BACKEND (extension), backend_name);
++		if (local_error)
++			g_debug ("%s: Failed to get tasks list: %s", G_STRFUNC, local_error->message);
+ 
+-	extension_name = E_SOURCE_EXTENSION_AUTHENTICATION;
+-	extension = e_source_get_extension (source, extension_name);
++		g_clear_object (&tasks_service);
++		g_clear_object (&authorizer);
++		g_clear_error (&local_error);
++	}
++#endif /* GDATA_CHECK_VERSION(0,15,1) */
+ 
+-	e_source_authentication_set_host (E_SOURCE_AUTHENTICATION (extension), "www.google.com");
+-	if (google_backend_can_use_google_auth (collection_source))
+-		e_source_authentication_set_method (E_SOURCE_AUTHENTICATION (extension), "Google");
+-	else
+-		e_source_authentication_set_method (E_SOURCE_AUTHENTICATION (extension), "OAuth2");
++	if (any_success) {
++		ESourceRegistryServer *server;
+ 
+-	e_binding_bind_property (
+-		collection_extension, "identity",
+-		extension, "user",
+-		G_BINDING_SYNC_CREATE);
++		server = e_collection_backend_ref_server (collection);
+ 
+-	extension_name = E_SOURCE_EXTENSION_ALARMS;
+-	extension = e_source_get_extension (source, extension_name);
+-	e_source_alarms_set_include_me (E_SOURCE_ALARMS (extension), FALSE);
++		if (server) {
++			g_hash_table_foreach (known_sources, google_remove_unknown_sources_cb, server);
++			g_object_unref (server);
++		}
++	}
+ 
+-	server = e_collection_backend_ref_server (backend);
+-	e_source_registry_server_add_source (server, source);
+-	g_object_unref (server);
++	g_hash_table_destroy (known_sources);
++	e_named_parameters_free (credentials_copy);
+ 
+-	g_object_unref (source);
++	return result;
+ }
+-#endif /* GDATA_CHECK_VERSION(0,15,1) */
+ 
+ static void
+ google_backend_add_contacts (ECollectionBackend *backend)
+@@ -697,7 +771,6 @@
+ google_backend_populate (ECollectionBackend *backend)
+ {
+ 	GList *list, *link;
+-	gboolean have_tasks = FALSE;
+ 	ESourceRegistryServer *server;
+ 	ESourceCollection *collection_extension;
+ 	ESource *source;
+@@ -713,10 +786,6 @@
+ 
+ 			resource = e_source_get_extension (source, E_SOURCE_EXTENSION_RESOURCE);
+ 			child = e_collection_backend_new_child (backend, e_source_resource_get_identity (resource));
+-#if GDATA_CHECK_VERSION(0,15,1)
+-		} else if (e_source_has_extension (source, E_SOURCE_EXTENSION_TASK_LIST)) {
+-			child = e_collection_backend_new_child (backend, GOOGLE_TASKS_RESOURCE_ID);
+-#endif
+ 		} else if (e_source_has_extension (source, E_SOURCE_EXTENSION_ADDRESS_BOOK)) {
+ 			child = e_collection_backend_new_child (backend, GOOGLE_CONTACTS_RESOURCE_ID);
+ 		}
+@@ -730,19 +799,6 @@
+ 	g_list_free_full (list, g_object_unref);
+ 	g_object_unref (server);
+ 
+-	list = e_collection_backend_list_calendar_sources (backend);
+-	for (link = list; link && !have_tasks; link = g_list_next (link)) {
+-		ESource *source = link->data;
+-
+-		have_tasks = have_tasks || e_source_has_extension (source, E_SOURCE_EXTENSION_TASK_LIST);
+-	}
+-	g_list_free_full (list, (GDestroyNotify) g_object_unref);
+-
+-#if GDATA_CHECK_VERSION(0,15,1)
+-	if (!have_tasks)
+-		google_backend_add_tasks (backend);
+-#endif
+-
+ 	source = e_backend_get_source (E_BACKEND (backend));
+ 	collection_extension = e_source_get_extension (source, E_SOURCE_EXTENSION_COLLECTION);
+ 
+@@ -777,7 +833,7 @@
+ 
+ 	extension_name = E_SOURCE_EXTENSION_TASK_LIST;
+ 	if (e_source_has_extension (child_source, extension_name))
+-		return g_strdup (GOOGLE_TASKS_RESOURCE_ID);
++		return E_COLLECTION_BACKEND_CLASS (e_google_backend_parent_class)->dup_resource_id (backend, child_source);
+ 
+ 	extension_name = E_SOURCE_EXTENSION_ADDRESS_BOOK;
+ 	if (e_source_has_extension (child_source, extension_name))
+--- a/calendar/backends/gtasks/e-cal-backend-gtasks.c
++++ b/calendar/backends/gtasks/e-cal-backend-gtasks.c
+@@ -253,7 +253,11 @@
+ 	}
+ 
+ 	g_clear_object (&gtasks->priv->tasklist);
+-	gtasks->priv->tasklist = gdata_tasks_tasklist_new (id);
++
++	if (g_str_has_prefix (id, "gtasks::"))
++		gtasks->priv->tasklist = gdata_tasks_tasklist_new (id + 8);
++	else
++		gtasks->priv->tasklist = gdata_tasks_tasklist_new (id);
+ 
+ 	g_free (id);
+ }
+--- a/libedataserver/e-source-webdav.c
++++ b/libedataserver/e-source-webdav.c
+@@ -126,7 +126,7 @@
+ 	 */
+ 
+ 	user = g_value_get_string (source_value);
+-	if (user == NULL || *user == '\0') {
++	if ((user == NULL || *user == '\0') && !*method) {
+ 		g_value_set_string (target_value, "none");
+ 	} else if (g_str_equal (method, "none")) {
+ 		g_value_set_string (target_value, "plain/password");
