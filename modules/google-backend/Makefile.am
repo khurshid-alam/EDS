@@ -13,6 +13,8 @@ module_google_backend_la_CPPFLAGS = \
 
 module_google_backend_la_SOURCES = \
 	module-google-backend.c \
+	e-gdata-oauth2-authorizer.c \
+	e-gdata-oauth2-authorizer.h \
 	$(NULL)
 
 module_google_backend_la_LIBADD = \
